@@ -1,143 +1,217 @@
-name: build
+name: Build Sorrowed
 
 on:
   push:
-    branches: [ "**" ]
   pull_request:
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      # The repo may contain the mod only as a .zip (e.g. hollowburst-mod.zip).
-      # If no Gradle project is visible, extract every zip into _src/ first.
-      - name: Extract zipped source if needed
+      - name: Locate the project (handles zip-in-repo and nested-folder uploads)
+        id: root
         run: |
-          echo "::group::Repository contents"
-          find . -maxdepth 3 -not -path './.git/*' | sort
-          echo "::endgroup::"
-          if [ -z "$(find . -maxdepth 3 \( -name build.gradle -o -name build.gradle.kts \) -not -path './.git/*' | head -1)" ]; then
-            # Space-safe loop: browsers often save duplicates as "name (1).zip".
-            find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' -print0 | while IFS= read -r -d '' z; do
-              echo "Extracting: $z"
-              d="_src/$(basename "$z" .zip | tr ' ' '_')"
-              mkdir -p "$d"
-              unzip -q -o "$z" -d "$d" || echo "::warning::Could not unzip $z"
+          set -e
+          if [ ! -f settings.gradle ]; then
+            for z in *.zip; do
+              if [ -f "$z" ]; then
+                echo "Found $z in the repo root - extracting it"
+                mkdir -p _extracted
+                unzip -q -o "$z" -d _extracted
+              fi
             done
           fi
+          ROOT=$(find . -maxdepth 4 -name settings.gradle -not -path './.git/*' | head -n 1 | xargs -r dirname)
+          if [ -z "$ROOT" ]; then
+            echo "::error::No settings.gradle found. Upload the EXTRACTED contents of the zip (src/, build.gradle, settings.gradle, gradle.properties), not the zip itself."
+            ls -la
+            exit 1
+          fi
+          echo "Project root: $ROOT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
 
-      - name: Locate project and wrapper
-        id: proj
-        run: |
-          BG=$(find . -maxdepth 5 \( -name build.gradle -o -name build.gradle.kts \) -not -path './.git/*' -not -path '*/node_modules/*' | sort | head -1)
-          if [ -z "$BG" ]; then
-            echo "::warning::No build.gradle found anywhere (even inside zips); skipping build."
-            find . -maxdepth 3 -not -path './.git/*' | head -50
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          DIR=$(dirname "$BG")
-          echo "Project directory: $DIR"
-          echo "found=true" >> "$GITHUB_OUTPUT"
-          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
-          if [ -f "$DIR/gradlew" ] && [ -f "$DIR/gradle/wrapper/gradle-wrapper.jar" ]; then
-            echo "wrapper=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::No Gradle wrapper found; using a CI-provided Gradle."
-            echo "wrapper=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Detect Minecraft version and required JDK
-        id: mc
-        if: steps.proj.outputs.found == 'true'
-        working-directory: ${{ steps.proj.outputs.dir }}
-        run: |
-          MC=""
-          if [ -f gradle.properties ]; then
-            MC=$(grep -E '^[[:space:]]*minecraft_version[[:space:]]*=' gradle.properties | head -1 | cut -d= -f2 | tr -d ' \r')
-          fi
-          if [ -z "$MC" ]; then
-            MC=$(grep -oE 'net\.minecraftforge:forge:1\.[0-9]+(\.[0-9]+)?' build.gradle 2>/dev/null | head -1 | sed 's/.*forge://')
-          fi
-          case "$MC" in
-            1.21*|1.22*|1.23*) JAVA=21; GRADLE=8.8 ;;
-            *)                 JAVA=17; GRADLE=8.1.1 ;;
-          esac
-          echo "Detected Minecraft '${MC:-unknown}' -> JDK $JAVA, fallback Gradle $GRADLE"
-          echo "mc=${MC:-unknown}" >> "$GITHUB_OUTPUT"
-          echo "java=$JAVA" >> "$GITHUB_OUTPUT"
-          echo "gradle=$GRADLE" >> "$GITHUB_OUTPUT"
-
-      - name: Set up JDK
-        if: steps.proj.outputs.found == 'true'
-        uses: actions/setup-java@v5
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ steps.mc.outputs.java }}
+          java-version: '17'
 
-      - name: Set up Gradle
-        if: steps.proj.outputs.found == 'true'
-        uses: gradle/actions/setup-gradle@v5
-        continue-on-error: true
+      - name: Set up Gradle 8.1.1
+        uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: ${{ steps.proj.outputs.wrapper == 'false' && steps.mc.outputs.gradle || '' }}
-          cache-disabled: true
-          validate-wrappers: false
+          gradle-version: 8.1.1
 
-      # Syntax-agnostic workaround for "Task with path 'reobfJar' not found".
-      # Instead of editing build.gradle (whose exact form we cannot know), an init
-      # script registers an empty no-op reobfJar task in any project that lacks one.
-      # Whatever finalizedBy/dependsOn wiring the build uses is then satisfied.
-      # Projects whose plugin really provides reobfJar are left untouched.
-      - name: Create Gradle init script and dump diagnostics
-        if: steps.proj.outputs.found == 'true'
-        working-directory: ${{ steps.proj.outputs.dir }}
+      - name: Check project files and resources
+        working-directory: ${{ steps.root.outputs.root }}
         run: |
-          cat > "$RUNNER_TEMP/ci-init.gradle" << 'INIT'
-          allprojects {
-            afterEvaluate { p ->
-              if (p.tasks.findByName('reobfJar') == null) {
-                p.logger.warn("CI: no reobfJar task in ${p.name}; registering a no-op stub")
-                p.tasks.register('reobfJar')
-              }
-            }
-          }
-          INIT
-          echo "::group::plugins / reobf references in build files"
-          grep -n -E "plugins|id[ (]|net\.minecraftforge|neoforge|reobf|finalizedBy|mappings" build.gradle build.gradle.kts 2>/dev/null || true
-          echo "::endgroup::"
-          echo "::group::gradle.properties"
-          cat gradle.properties 2>/dev/null || true
-          echo "::endgroup::"
+          set -e
+          for f in build.gradle settings.gradle gradle.properties src/main/resources/META-INF/mods.toml src/main/resources/pack.mcmeta; do
+            [ -f "$f" ] || { echo "::error::Missing $f"; exit 1; }
+          done
+          grep -q "reobfJar" build.gradle || { echo "::error::build.gradle must contain: finalizedBy 'reobfJar' (without it the jar crashes in-game with NoSuchMethodError)"; exit 1; }
+          cat > /tmp/validate_resources.py <<'PYEOF2'
+          #!/usr/bin/env python3
+          """Catches the mistakes that only show up in-game: bad JSON, dangling model/texture/feature references."""
+          import glob, json, os, re, sys
 
-      - name: Build (wrapper)
-        if: steps.proj.outputs.found == 'true' && steps.proj.outputs.wrapper == 'true'
-        working-directory: ${{ steps.proj.outputs.dir }}
+          ROOT = sys.argv[1] if len(sys.argv) > 1 else "."
+          RES = os.path.join(ROOT, "src", "main", "resources")
+          props = {}
+          with open(os.path.join(ROOT, "gradle.properties")) as f:
+              for line in f:
+                  if "=" in line and not line.startswith("#"):
+                      k, v = line.strip().split("=", 1)
+                      props[k] = v
+          NS = props.get("mod_id", "sorrowed")
+          errors = []
+
+          def err(msg):
+              errors.append(msg)
+
+          def load(path):
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception as e:
+                  err(f"INVALID JSON {os.path.relpath(path, ROOT)}: {e}")
+                  return None
+
+          def mine(ref):
+              return ref.startswith(NS + ":")
+
+          def local(ref):
+              return ref.split(":", 1)[1]
+
+          def exists(rel):
+              return os.path.exists(os.path.join(RES, rel))
+
+          jsons = [p for p in glob.glob(RES + "/**/*", recursive=True) if p.endswith((".json", ".mcmeta"))]
+          docs = {p: load(p) for p in jsons}
+
+          for p, d in docs.items():
+              if d is None:
+                  continue
+              rel = os.path.relpath(p, RES).replace(os.sep, "/")
+              if rel.startswith(f"assets/{NS}/blockstates/"):
+                  def walk(o):
+                      if isinstance(o, dict):
+                          if "model" in o and isinstance(o["model"], str) and mine(o["model"]):
+                              if not exists(f"assets/{NS}/models/{local(o['model'])}.json"):
+                                  err(f"{rel}: missing model {o['model']}")
+                          for v in o.values():
+                              walk(v)
+                      elif isinstance(o, list):
+                          for v in o:
+                              walk(v)
+                  walk(d)
+              if rel.startswith(f"assets/{NS}/models/"):
+                  par = d.get("parent")
+                  if isinstance(par, str) and mine(par) and not exists(f"assets/{NS}/models/{local(par)}.json"):
+                      err(f"{rel}: missing parent {par}")
+                  for k, t in (d.get("textures") or {}).items():
+                      if isinstance(t, str) and mine(t) and not exists(f"assets/{NS}/textures/{local(t)}.png"):
+                          err(f"{rel}: missing texture {t}")
+              if rel.startswith(f"data/{NS}/dimension/"):
+                  t = d.get("type", "")
+                  if mine(t) and not exists(f"data/{NS}/dimension_type/{local(t)}.json"):
+                      err(f"{rel}: missing dimension_type {t}")
+              if rel.startswith(f"data/{NS}/dimension/"):
+                  b = ((d.get("generator") or {}).get("biome_source") or {}).get("biome", "")
+                  if isinstance(b, str) and mine(b) and not exists(f"data/{NS}/worldgen/biome/{local(b)}.json"):
+                      err(f"{rel}: missing biome {b}")
+              if rel.startswith(f"data/{NS}/worldgen/placed_feature/"):
+                  t = d.get("feature", "")
+                  if mine(t) and not exists(f"data/{NS}/worldgen/configured_feature/{local(t)}.json"):
+                      err(f"{rel}: missing configured_feature {t}")
+              if rel.startswith(f"data/{NS}/forge/biome_modifier/") and d.get("type") == "forge:add_features":
+                  t = d.get("features", "")
+                  if mine(t) and not exists(f"data/{NS}/worldgen/placed_feature/{local(t)}.json"):
+                      err(f"{rel}: missing placed_feature {t}")
+
+          mods_toml = os.path.join(RES, "META-INF", "mods.toml")
+          if not os.path.exists(mods_toml):
+              err("src/main/resources/META-INF/mods.toml is missing")
+          if not os.path.exists(os.path.join(RES, "pack.mcmeta")):
+              err("src/main/resources/pack.mcmeta is missing")
+
+          main_src = glob.glob(ROOT + "/src/main/java/**/*.java", recursive=True)
+          ids = set()
+          for p in main_src:
+              with open(p, encoding="utf-8") as f:
+                  ids.update(re.findall(r'@Mod\("([^"]+)"\)', f.read()))
+                  f.seek(0)
+                  ids.update(re.findall(r'@Mod\(\s*\w+\.MODID\s*\)', f.read()) and [NS])
+          if NS not in ids:
+              err(f"No @Mod class found for mod_id '{NS}' (gradle.properties mod_id must match the @Mod id)")
+
+          if errors:
+              print("Resource validation FAILED:")
+              for e in errors:
+                  print("  -", e)
+              sys.exit(1)
+          print(f"Resource validation OK ({len(jsons)} json files checked)")
+
+          PYEOF2
+          python3 /tmp/validate_resources.py .
+
+      - name: Build jar
+        working-directory: ${{ steps.root.outputs.root }}
+        run: gradle build --no-daemon --stacktrace --warning-mode all
+
+      - name: Inspect the jar for common in-game crash causes
+        working-directory: ${{ steps.root.outputs.root }}
         run: |
-          chmod +x ./gradlew
-          ./gradlew build --no-daemon --stacktrace --init-script "$RUNNER_TEMP/ci-init.gradle"
+          set -e
+          MODID=$(grep '^mod_id=' gradle.properties | cut -d= -f2)
+          JAR=$(ls build/libs/*.jar | grep -v -- '-sources' | grep -v -- '-javadoc' | head -n 1)
+          echo "Jar: $JAR"
+          unzip -l "$JAR"
 
-      - name: Build (CI-provided Gradle)
-        if: steps.proj.outputs.found == 'true' && steps.proj.outputs.wrapper == 'false'
-        working-directory: ${{ steps.proj.outputs.dir }}
-        run: gradle build --no-daemon --stacktrace --init-script "$RUNNER_TEMP/ci-init.gradle"
+          echo "--- mods.toml as shipped"
+          unzip -p "$JAR" META-INF/mods.toml | tee /tmp/mods.toml
+          if grep -q '\${' /tmp/mods.toml; then
+            echo "::error::mods.toml still contains unexpanded \${...} tokens. Check processResources/filesMatching in build.gradle and every key in gradle.properties."
+            exit 1
+          fi
+          grep -q "modId=\"$MODID\"" /tmp/mods.toml || { echo "::error::mods.toml modId does not match mod_id=$MODID"; exit 1; }
 
-      - name: Upload mod jar
-        if: success() && steps.proj.outputs.found == 'true'
-        uses: actions/upload-artifact@v6
+          unzip -l "$JAR" | grep -q 'pack.mcmeta' || { echo "::error::pack.mcmeta missing from jar"; exit 1; }
+          unzip -l "$JAR" | grep -q '\.class' || { echo "::error::No compiled classes in the jar"; exit 1; }
+          unzip -l "$JAR" | grep -q "assets/$MODID/" || echo "::warning::No assets/$MODID/ folder in jar - textures, models and lang will be missing"
+          unzip -l "$JAR" | grep -q "data/$MODID/" || echo "::warning::No data/$MODID/ folder in jar - dimensions and worldgen will be missing"
+
+          echo "--- reobfuscation check"
+          rm -rf /tmp/jarcheck && mkdir /tmp/jarcheck && unzip -q "$JAR" -d /tmp/jarcheck
+          SRG=$(grep -rlE 'm_[0-9]{3,}_' /tmp/jarcheck --include='*.class' | wc -l || true)
+          if [ "$SRG" -eq 0 ]; then
+            echo "::warning::No SRG (m_12345_) names found in the classes. If the game crashes with NoSuchMethodError, the jar was not reobfuscated - make sure the 'jar' task is finalizedBy 'reobfJar'."
+          else
+            echo "OK: $SRG class files use runtime (SRG) names"
+          fi
+
+          echo "--- Java class version (61 = Java 17)"
+          FIRST=$(find /tmp/jarcheck -name '*.class' | head -n 1)
+          javap -v "$FIRST" | grep 'major version'
+
+      - name: Upload the mod jar
+        uses: actions/upload-artifact@v4
         with:
-          name: mod-${{ steps.mc.outputs.mc }}
+          name: sorrowed-jar
           path: |
-            ${{ steps.proj.outputs.dir }}/build/libs/*.jar
-            !${{ steps.proj.outputs.dir }}/build/libs/*-sources.jar
-            !${{ steps.proj.outputs.dir }}/build/libs/*-javadoc.jar
-          if-no-files-found: warn
+            ${{ steps.root.outputs.root }}/build/libs/*.jar
+            !${{ steps.root.outputs.root }}/build/libs/*-sources.jar
+          if-no-files-found: error
+
+      - name: Upload reports if the build failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            ${{ steps.root.outputs.root }}/build/reports
+            ${{ steps.root.outputs.root }}/build/tmp
+          if-no-files-found: ignore
