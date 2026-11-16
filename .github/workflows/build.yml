@@ -1,0 +1,143 @@
+name: build
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # The repo may contain the mod only as a .zip (e.g. hollowburst-mod.zip).
+      # If no Gradle project is visible, extract every zip into _src/ first.
+      - name: Extract zipped source if needed
+        run: |
+          echo "::group::Repository contents"
+          find . -maxdepth 3 -not -path './.git/*' | sort
+          echo "::endgroup::"
+          if [ -z "$(find . -maxdepth 3 \( -name build.gradle -o -name build.gradle.kts \) -not -path './.git/*' | head -1)" ]; then
+            # Space-safe loop: browsers often save duplicates as "name (1).zip".
+            find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' -print0 | while IFS= read -r -d '' z; do
+              echo "Extracting: $z"
+              d="_src/$(basename "$z" .zip | tr ' ' '_')"
+              mkdir -p "$d"
+              unzip -q -o "$z" -d "$d" || echo "::warning::Could not unzip $z"
+            done
+          fi
+
+      - name: Locate project and wrapper
+        id: proj
+        run: |
+          BG=$(find . -maxdepth 5 \( -name build.gradle -o -name build.gradle.kts \) -not -path './.git/*' -not -path '*/node_modules/*' | sort | head -1)
+          if [ -z "$BG" ]; then
+            echo "::warning::No build.gradle found anywhere (even inside zips); skipping build."
+            find . -maxdepth 3 -not -path './.git/*' | head -50
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          DIR=$(dirname "$BG")
+          echo "Project directory: $DIR"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          if [ -f "$DIR/gradlew" ] && [ -f "$DIR/gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "wrapper=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No Gradle wrapper found; using a CI-provided Gradle."
+            echo "wrapper=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect Minecraft version and required JDK
+        id: mc
+        if: steps.proj.outputs.found == 'true'
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          MC=""
+          if [ -f gradle.properties ]; then
+            MC=$(grep -E '^[[:space:]]*minecraft_version[[:space:]]*=' gradle.properties | head -1 | cut -d= -f2 | tr -d ' \r')
+          fi
+          if [ -z "$MC" ]; then
+            MC=$(grep -oE 'net\.minecraftforge:forge:1\.[0-9]+(\.[0-9]+)?' build.gradle 2>/dev/null | head -1 | sed 's/.*forge://')
+          fi
+          case "$MC" in
+            1.21*|1.22*|1.23*) JAVA=21; GRADLE=8.8 ;;
+            *)                 JAVA=17; GRADLE=8.1.1 ;;
+          esac
+          echo "Detected Minecraft '${MC:-unknown}' -> JDK $JAVA, fallback Gradle $GRADLE"
+          echo "mc=${MC:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "java=$JAVA" >> "$GITHUB_OUTPUT"
+          echo "gradle=$GRADLE" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK
+        if: steps.proj.outputs.found == 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ steps.mc.outputs.java }}
+
+      - name: Set up Gradle
+        if: steps.proj.outputs.found == 'true'
+        uses: gradle/actions/setup-gradle@v5
+        continue-on-error: true
+        with:
+          gradle-version: ${{ steps.proj.outputs.wrapper == 'false' && steps.mc.outputs.gradle || '' }}
+          cache-disabled: true
+          validate-wrappers: false
+
+      # Syntax-agnostic workaround for "Task with path 'reobfJar' not found".
+      # Instead of editing build.gradle (whose exact form we cannot know), an init
+      # script registers an empty no-op reobfJar task in any project that lacks one.
+      # Whatever finalizedBy/dependsOn wiring the build uses is then satisfied.
+      # Projects whose plugin really provides reobfJar are left untouched.
+      - name: Create Gradle init script and dump diagnostics
+        if: steps.proj.outputs.found == 'true'
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          cat > "$RUNNER_TEMP/ci-init.gradle" << 'INIT'
+          allprojects {
+            afterEvaluate { p ->
+              if (p.tasks.findByName('reobfJar') == null) {
+                p.logger.warn("CI: no reobfJar task in ${p.name}; registering a no-op stub")
+                p.tasks.register('reobfJar')
+              }
+            }
+          }
+          INIT
+          echo "::group::plugins / reobf references in build files"
+          grep -n -E "plugins|id[ (]|net\.minecraftforge|neoforge|reobf|finalizedBy|mappings" build.gradle build.gradle.kts 2>/dev/null || true
+          echo "::endgroup::"
+          echo "::group::gradle.properties"
+          cat gradle.properties 2>/dev/null || true
+          echo "::endgroup::"
+
+      - name: Build (wrapper)
+        if: steps.proj.outputs.found == 'true' && steps.proj.outputs.wrapper == 'true'
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew build --no-daemon --stacktrace --init-script "$RUNNER_TEMP/ci-init.gradle"
+
+      - name: Build (CI-provided Gradle)
+        if: steps.proj.outputs.found == 'true' && steps.proj.outputs.wrapper == 'false'
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: gradle build --no-daemon --stacktrace --init-script "$RUNNER_TEMP/ci-init.gradle"
+
+      - name: Upload mod jar
+        if: success() && steps.proj.outputs.found == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: mod-${{ steps.mc.outputs.mc }}
+          path: |
+            ${{ steps.proj.outputs.dir }}/build/libs/*.jar
+            !${{ steps.proj.outputs.dir }}/build/libs/*-sources.jar
+            !${{ steps.proj.outputs.dir }}/build/libs/*-javadoc.jar
+          if-no-files-found: warn
